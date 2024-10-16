@@ -1,0 +1,238 @@
+---
+title: "Process Crashes Inside Boroughs of NYC"
+author: "Nathan Kurtz-Enko"
+format: pdf
+editor: source
+message: false
+warning: false
+---
+
+## Introduction
+
+The following document describes the process for processing motor vehicle crashes data for NYC boroughs. This assumes that you have a spatial file describing the boundaries of each of the boroughs, as well as weather data for a number of years.
+
+## Libraries
+
+We will need the following libraries for general data manipulations, as well as handling raster and vector spatial data.
+
+```{r}
+library(tidyverse) # For general data manipulation tasks
+
+library(sf) # For handling vector data
+
+library(tidygeocoder) # For geocoding spatial data
+```
+
+## Load Data
+
+Now, we can load the motor vehicle crashes data.
+
+```{r}
+# Read the crashes data
+crashes_raw <- read_csv("./data/nyc_crashes.csv")
+
+# Convert column names to snake_case
+names(crashes_raw) <- str_replace_all(tolower(names(crashes_raw)), " ", "_")
+
+# Look at a summary of the data
+summary(crashes_raw)
+
+# Look at percentage of missing data
+colMeans(is.na(crashes_raw))
+```
+
+And now the boroughs data.
+
+```{r}
+# Read the data
+boroughs <- st_read("./data/nyc_boroughs.geojson")
+```
+
+Finally, we can load the weather data.
+
+```{r}
+# Load the data
+weather <- read_csv("./data/nyc_weather.csv") |>
+  # To make joining with crashes simpler, select one point
+  filter(longitude == -74.00 & latitude == 40.65) 
+```
+
+## EDA
+
+The crashes data has some missing values in the lat/lon fields. However, it appears that other information about the location is still present (e.g., on_street_name is mostly present when lat/lon are missing). We could use the Bing Maps API, or a similar service, to get the approximate location of these collisions given these are location identifiers. Or we could drop them. 
+
+```{r}
+# Visualize the chosen weather location
+pts <- weather |>
+  distinct(latitude, longitude) |>
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+ggplot() +
+  geom_sf(data = st_as_sfc(boroughs)) +
+  geom_sf(data = pts, color = "red", size = 3) +
+  theme_minimal() +
+  labs(title = "NYC Boroughs & Weather Location")
+
+# Borough, on_street_name, off_street_name are only partially missing
+crashes_raw |>
+  filter(is.na(latitude) | is.na(longitude)) |>
+  # filter(!is.na(on_street_name)) |>
+  select(crash_date, on_street_name, off_street_name, borough) |>
+  is.na() |>
+  colMeans()
+
+# What is the percent of data missing in the lat/lon columns
+rows_w_na <- nrow(crashes_raw)
+
+rows_wo_na <- crashes_raw |>
+  filter(!is.na(longitude) & !is.na(latitude)) |>
+  nrow()
+
+print((rows_w_na - rows_wo_na) / rows_w_na)
+```
+
+## Geocoding
+
+To geocode data, we first must find the rows that have missing latitude/longitude coordinate.
+
+```{r}
+crashes_streets <- crashes_raw |>
+  mutate(
+    borough = str_to_lower(borough),
+    street = coalesce(on_street_name, off_street_name, cross_street_name) |>
+      str_to_lower() |>
+      str_squish(),
+    address = str_c(str_c(street, borough, "NY", sep = ", "), zip_code, sep = " "),
+    address2 = str_c(street, borough, "NY", sep = ", "),
+    address3 = str_c(str_c(street, "NY", sep = ", "), zip_code, sep = " "),
+    address4 = str_c(street, "NY", sep = ", "),
+    address = coalesce(address, address2, address3, address4),
+  ) |>
+  select(!c(address2, address3, address4, street))
+```
+
+Now, we can use the `tidygeocoder` to define lat/lon coordinates from the `on_street_name`, `off_street_name`, `cross_street_name`, etc.
+
+```{r}
+crashes_geo <- crashes_streets |>
+  select(collision_id, address, latitude, longitude) |>
+  filter(is.na(latitude) | is.na(longitude)) |>
+  select(!c(latitude, longitude)) |>
+  drop_na(address) |>
+  distinct(address, .keep_all = TRUE) |>
+  geocode_combine(
+    queries = list(
+      list(method = "arcgis"),
+      list(method = "osm")
+    ),
+    global_params = list(address = "address")
+  )
+
+# write_csv(crashes_geo, "./data/crashes_geo.csv")
+```
+
+Now we can combine the geocoded values with the original data and coalese missing lat/lon coordinates.
+
+```{r}
+crashes_fill_coords <- crashes_streets |> 
+  filter(is.na(latitude) | is.na(longitude)) |>
+  left_join(crashes_geo, by = "address") |>
+  select(collision_id = collision_id.x, lat, long) |>
+  right_join(crashes_streets, by = "collision_id") |>
+  mutate(
+    latitude = coalesce(latitude, lat),
+    longitude = coalesce(longitude, long),
+    .keep = "unused"
+  ) |>
+  select(!address)
+```
+
+Double check how things have been filled in.
+
+```{r}
+select(crashes_fill_coords, latitude, longitude) |>
+  is.na() |>
+  colMeans()
+
+glimpse(crashes_fill_coords)
+```
+
+## Final Cleanup
+
+For the time being, we will drop the observations with missing data in the lon/lat columns even though this represents 11% of the overall data. This is because these observations prevent coercing the data to a spatial object, and thereby prevent a quick fill of the borough column. We can go back and change this, but again, for the time this will enable use to continue EDA and subsequent analysis/visualization. We will also drop a number of columns that had very little data per the summary tables above.
+
+```{r}
+# Define columns to drop during cleaning
+drop_vars <- c(
+  "contributing_factor_vehicle_3",
+  "contributing_factor_vehicle_4",
+  "contributing_factor_vehicle_5",
+  "vehicle_type_code_3",
+  "vehicle_type_code_4",
+  "vehicle_type_code_5",
+  "zip_code",
+  "on_street_name",
+  "off_street_name",
+  "cross_street_name",
+  "datetime_char",
+  "datetime_edt",
+  "crash_date",
+  "crash_time",
+  "location"
+)
+
+# Clean up the crash data
+crashes_clean <- crashes_fill_coords |>
+  # Drop NAs in the lon/lat columns since that prevents coercing to sf
+  drop_na(latitude, longitude) |>
+  # Do preliminary filtering on lon/lat to get points in NYC
+  filter(
+    between(longitude, -75, -73),
+    between(latitude, 40, 41)
+  ) |>
+  # Convert crash_date & crash_time to datetime_utc
+  mutate(
+    datetime_char = str_c(mdy(crash_date), crash_time, sep = "T"),
+    datetime_edt = ymd_hms(datetime_char, tz = "America/New_York"),
+    datetime_utc = with_tz(datetime_edt, tz = "UTC")
+  ) |>
+  # Drop empty & redundant columns
+  select(!any_of(drop_vars)) |>
+  # Coerce to sf
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) |>
+  # Bring in borough information
+  st_intersection(boroughs) |>
+  # Fill NAs for borough column using the results from previous step
+  mutate(borough = str_to_lower((coalesce(borough, boro_name)))) |>
+  # Drop unnecessary columns
+  select(!boro_code:shape_leng) |>
+  # Drop remaining NAs in number_of_persons_injured & number_of_persons_killed
+  drop_na(number_of_persons_injured, number_of_persons_killed)
+
+colMeans(is.na(crashes_clean))
+```
+
+## Join Weather Data
+
+Now we can join the weather by temporal closeness. This can be achieved rounding the datetime from the crashes data to the nearest hour, and then joining with the weather data.
+
+```{r}
+# Join weather point in temporally nearest
+crashes_w_weather <- as_tibble(crashes_clean) |>
+  mutate(round_time_utc = round_date(datetime_utc, unit = "hour")) |>
+  inner_join(weather, by = c("round_time_utc" = "datetime_utc")) |>
+  # Drop the weather coordinate values and the rounded time
+  select(!c(longitude, latitude, round_time_utc)) |>
+  # Fill in NAs with zero, alternatively we can drop or use another technique
+  # Filling in with zero because the weather processing step might generate NAs
+  mutate(across(u10:tcslw, \(x) coalesce(x, 0)))
+
+# Check out the data to make sure things are okay
+glimpse(crashes_w_weather)
+
+# Most columns have relatively low missing data
+colMeans(is.na(crashes_w_weather))
+
+# Save the result
+write_csv(crashes_w_weather, "./data/nyc_crashes_w_weather.csv")
+```

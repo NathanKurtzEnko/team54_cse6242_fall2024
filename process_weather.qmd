@@ -1,0 +1,109 @@
+---
+title: "Process ERA5 Weather Data Inside Boroughs of NYC"
+author: "Nathan Kurtz-Enko"
+format: pdf
+editor: source
+message: false
+warning: false
+---
+
+## Introduction
+
+The following document describes the process for processing ERA5 weather data for NYC boroughs. This assumes that you have a spatial file describing the boundaries of each of the boroughs, as well as weather data for a number of years.
+
+## Libraries
+
+We will need the following libraries for general data manipulations, as well as handling raster and vector spatial data.
+
+```{r}
+library(tidyverse) # For general data manipulation tasks
+
+library(terra) # For handling raster and vector data
+
+library(sf) # Also for handling vector data
+```
+
+## Load & Crop Data
+
+The weather data that we have is for an area greater than that of the NYC boroughs. This makes transforming it into a more digestible format challenging. So, we will load the weather data, and simultaneously crop the data to only have information in the areas defined by the NYC boroughs.
+
+First we will load the boroughs.
+
+```{r}
+# Load the data
+boroughs <- vect("./data/nyc_boroughs.geojson")
+
+# Take a look to make sure everything is alright
+plot(boroughs, main = "Spatial Extent of NYC Boroughs")
+```
+
+Next, we will load the weather data. Note, we will crop each set of data as we load it.
+
+```{r}
+# Get file locations for weather data
+weather_files <- list.files("./data/", pattern = "\\.nc$", full.names = TRUE)
+
+# Load and crop data
+weather_raw <- weather_files |>
+  map(\(x) crop(rast(x), boroughs), .progress = TRUE)
+```
+
+## Convert Spatial Data To CSV
+
+Now that the data has been loaded, we can convert it into a format that is more ingestible, a CSV file. To do this, we will convert from a raster into collection of points, extract the coordinates from each point, convert the data to a tibble, and rearrange the columns a bit.
+
+```{r}
+convert_to_tibble <- function(data) {
+  # Extract points from data
+  sf <- as.points(data) |>
+    st_as_sf() |>
+    drop_na()
+
+  # Get the coordinates from points
+  coords <- st_coordinates(sf) |>
+    as_tibble() |>
+    rename(longitude = X, latitude = Y)
+
+  # Convert the data to a tibble
+  st_drop_geometry(sf) |>
+    bind_cols(coords) |>
+    # Variables names and dates are stored in the column names
+    # Pivot the data so that we can extract those features
+    pivot_longer(
+      cols = !c(latitude, longitude),
+      names_to = "variable",
+      values_to = "value"
+    ) |>
+    # Separate variables from dates
+    separate_wider_delim(
+      variable,
+      delim = "=",
+      names = c("variable", "datetime_utc")
+    ) |>
+    # Clean up variables and transform dates to POSIXct
+    mutate(
+      variable = str_extract(variable, "^([^_]+)"),
+      datetime_utc = as.POSIXct(as.numeric(datetime_utc), tz = "UTC")
+    ) |>
+    # Put variable names back into columns
+    pivot_wider(
+      id_cols = c("datetime_utc", "longitude", "latitude"),
+      names_from = "variable",
+      values_from = "value"
+    ) |>
+    # Drop any introduced NAs
+    drop_na()
+}
+
+weather_tibble <- weather_raw |>
+  map(convert_to_tibble, .progress = TRUE) |>
+  list_rbind()
+```
+
+## Save Results
+
+Now that the data has been processed, we can save the results.
+
+```{r}
+write_csv(weather_tibble, "./data/nyc_weather.csv")
+```
