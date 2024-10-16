@@ -82,3 +82,4 @@ There are a lot of tools that will be used in this project, and not everyone mig
 
 -   Geographic data science with Python: https://geographicdata.science/book/intro.html
 
+-   The GIT reference: https://git-scm.com/docs
