@@ -97,7 +97,10 @@ convert_to_tibble <- function(data) {
 
 weather_tibble <- weather_raw |>
   map(convert_to_tibble, .progress = TRUE) |>
-  list_rbind()
+  list_rbind() |>
+  split(1:2)
+
+weather_files <- str_c("./data/weather/clean/nyc_weather_", 1:2, ".csv")
 ```
 
 ## Save Results
@@ -105,5 +108,5 @@ weather_tibble <- weather_raw |>
 Now that the data has been processed, we can save the results.
 
 ```{r}
-write_csv(weather_tibble, "./data/nyc_weather.csv")
+walk2(weather_tibble, weather_files, write_csv)
 ```

@@ -28,8 +28,12 @@ library(tidygeocoder) # For geocoding spatial data
 Now, we can load the motor vehicle crashes data.
 
 ```{r}
+# Get crashes files
+crashes_files <- list.files("./data/crashes/raw/", full.names = TRUE)
+
 # Read the crashes data
-crashes_raw <- read_csv("./data/nyc_crashes.csv")
+crashes_raw <- map(crashes_files, read_csv) |>
+  list_rbind()
 
 # Convert column names to snake_case
 names(crashes_raw) <- str_replace_all(tolower(names(crashes_raw)), " ", "_")
@@ -51,8 +55,12 @@ boroughs <- st_read("./data/nyc_boroughs.geojson")
 Finally, we can load the weather data.
 
 ```{r}
+# Get weather files
+weather_files <- list.files("./data/weather/clean/", full.names = TRUE)
+
 # Load the data
-weather <- read_csv("./data/nyc_weather.csv") |>
+weather <- map(weather_files, read_csv) |>
+  list_rbind() |>
   # To make joining with crashes simpler, select one point
   filter(longitude == -74.00 & latitude == 40.65) 
 ```
@@ -233,6 +241,17 @@ glimpse(crashes_w_weather)
 # Most columns have relatively low missing data
 colMeans(is.na(crashes_w_weather))
 
+# Split the data because Github has file size limitations
+crashes_w_weather_split <- crashes_w_weather |>
+  split(1:10)
+
+# Define file locations
+crashes_w_weather_files <- str_c(
+  "./data/crashes/clean/nyc_crashes_w_weather_", 
+  1:10, 
+  ".csv"
+)
+
 # Save the result
-write_csv(crashes_w_weather, "./data/nyc_crashes_w_weather.csv")
+walk2(crashes_w_weather_split, crashes_w_weather_files, write_csv)
 ```
