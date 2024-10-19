@@ -1,0 +1,115 @@
+---
+title: "Clustering Collsion Data Using DBSCAN & Other Techniques"
+author: "Nathan Kurtz-Enko"
+format: pdf
+message: false
+warning: false
+---
+
+## Intro
+It might be interesting to see how traffic collisions cluster through space and time. This could reveal hotspots or other patterns that we could analyze further. There are a number of techniques that we can use to cluster data. A preliminary approach would be K-Means, but to account for the spatial and temporal components of the data, a more sophisticated approach might be necessary. So, we will also consider DBSCAN, HDBSCAN, and other derivatives.
+
+## Libraries
+In order to load, handle, and cluster our data, we will require the following packages.
+
+```{r}
+library(tidyverse)
+
+library(dbscan)
+
+library(stdbscanr)
+
+library(knitr)
+```
+
+## Load & Clean Data
+Now, let us load the data and confirm the shape and completeness. We can see that most of the columns are numeric, which the exception of `contributing_factor_vehicle_1` through `vehicle_type_code_2` (also the only columns with missing data).
+
+```{r}
+# Get data files
+data_files <- list.files("./data/crashes/clean/", full.names = TRUE)
+
+# Load data
+data_raw <- list_rbind(map(data_files, read_csv))
+
+# Look at the data
+glimpse(data_raw)
+
+# How many missing values are there?
+colMeans(is.na(data_raw)) |>
+ as_tibble(rownames = "variable") |>
+ kable(caption = "Missing Data")
+```
+
+Since there is missing data in a few columns (and those columns are character data types), we will simply relable those values as "missing". We could instead use a sophisticated approach of converting that categorical data into factors and then using a classification model to fill in the values. Or we could encod them as numbers and use a regression model to estimate them. But, given the size of the data (+2mil records) that would take a lot computational power (which my laptop does not have).
+
+```{r}
+data_clean <- data_raw |>
+  # Get the lon/lat coords out of the geometry column
+  mutate(geometry = str_sub(geometry, 3L, -2L)) |>
+  separate(geometry, into = c("lon", "lat"), sep = ",") |>
+  mutate(lon = as.numeric(lon), lat = as.numeric(lat)) |>
+  # Classify data as missing
+  mutate(across(where(is.character), \(x) coalesce(x, "missing")))
+```
+
+Most of the algorithms that we will use require that the data be in a matrix rather than a data frame. There are subtle differences between these things, but at least it is easy to convert from one to another. So, we can take our "clean" data and convert that into a matrix. Additionally, we have a lot of data, and while it might be nice to cluster using everything, that is also computationally expensive. So we will grab a sample of points and use that for initial clustering. Then, we can use that model to predict clusters for the remainder of the data.
+
+```{r}
+set.seed(1234) # For reproducible results
+
+data_matrix <- data_clean |>
+  # Encode categorical data
+  mutate(across(where(is.character), \(x) as.numeric(as_factor(x)))) |> 
+  # Encode datetime data
+  mutate(datetime_utc = as.numeric(datetime_utc)) |>
+  sample_n(10000) |>
+  # Convert to matrix for clustering
+  as.matrix()
+```
+
+## Cluster Data
+We can begin with a common approach to clustering: K-Means. Here we will define a helper function to evaluate a number of cluster sizes so that we can find the value of K after which the "within sum of squares" does not improve much more. And finally, we can use that identified value of K to create our clustering model.
+
+```{r}
+# This helper function will get performance metrics on clusters for values of K
+test_kmeans <- function(k, data) {
+  clusters <- kmeans(data, centers = k)
+  tibble(tss = clusters$tot.withinss)
+}
+
+# Define a range of values for K
+k <- 2:20
+names(k) <- as.character(k)
+
+# Gather metrics for values of K
+km_test <- map(k, test_kmeans, data = data_matrix, .progress = TRUE) |>
+  list_rbind(names_to = "k") |>
+  mutate(k = parse_number(k))
+
+# Visualize Ks
+ggplot(data = km_test) +
+  geom_line(mapping = aes(x = k, y = tss)) +
+  theme_minimal() +
+  labs(title = "Total Sum of Squary Per K", subtitle = "For K-Means")
+
+# 10 seems like a good value for K
+best_k <- 10
+
+# Create the clustering model
+cluster_km <- kmeans(data_matrix, centers = best_k)
+```
+
+Now we can try DBSCAN and HDBSCAN. The convenience of the HDBSCAN algorithm is that it does not assume a particular number of clusters or shape. So, it is more flexible at identifying structure in the data than DBSCAN. For the regular DBSCAN algorithm, we must choose a "neighborhood" size, as well as a minimum number of points. So, we are basically defining the structure of the clusters before looking at the data. This requires a fair bit of care and some tuning of parameters. Fortunately, the `dbscan` package in R comes with a few tools to help with this.
+
+```{r}
+# Min points is recommended as # variables + 1
+min_points <- ncol(data_clean) + 1
+
+# Use this to find a value of "eps" for DBSCAN
+kNNdistplot(data_matrix, k = k)
+
+cluster_db <- dbscan(data_matrix, eps = 9000, minPts = min_points)
+
+cluster_hdb <- hdbscan(data_matrix, minPts = min_points)
+```
