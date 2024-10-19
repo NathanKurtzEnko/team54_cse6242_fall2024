@@ -7,7 +7,7 @@ warning: false
 ---
 
 ## Intro
-It might be interesting to see how traffic collisions cluster through space and time. This could reveal hotspots or other patterns that we could analyze further. There are a number of techniques that we can use to cluster data. A preliminary approach would be K-Means, but to account for the spatial and temporal components of the data, a more sophisticated approach might be necessary. So, we will also consider DBSCAN, HDBSCAN, and other derivatives.
+It might be interesting to see how traffic collisions cluster through space and time. This could reveal hotspots or other patterns that we could analyze further. There are a number of techniques that we can use to cluster data. Here, we will also consider HDBSCAN.
 
 ## Libraries
 In order to load, handle, and cluster our data, we will require the following packages.
@@ -53,54 +53,31 @@ data_clean <- data_raw |>
   separate(geometry, into = c("lon", "lat"), sep = ",") |>
   mutate(lon = as.numeric(lon), lat = as.numeric(lat)) |>
   # Classify data as missing
-  mutate(across(where(is.character), \(x) coalesce(x, "missing")))
+  mutate(across(where(is.character), \(x) coalesce(x, "missing"))) |>
+  mutate(total_casualties = number_of_persons_injured + number_of_persons_killed)
+  # filter(year(datetime_utc) == 2020)
+
 ```
 
-Most of the algorithms that we will use require that the data be in a matrix rather than a data frame. There are subtle differences between these things, but at least it is easy to convert from one to another. So, we can take our "clean" data and convert that into a matrix. Additionally, we have a lot of data, and while it might be nice to cluster using everything, that is also computationally expensive. So we will grab a sample of points and use that for initial clustering. Then, we can use that model to predict clusters for the remainder of the data.
+HDBSCAN is available in R via the `dbscan` package. However, this implementation requires the data be a matrix rather than a data frame. So, we can take our "clean" data and convert that into a matrix. Additionally, we have a lot of data, and while it might be nice to cluster using everything, that is also computationally expensive. So we will grab a sample of points and use that for initial clustering. Then, we can use that model to predict clusters for the remainder of the data.
 
 ```{r}
 set.seed(1234) # For reproducible results
 
 data_sample <- data_clean |>
   # Encode categorical data
-  mutate(across(where(is.character), \(x) as.numeric(as_factor(x)))) |> 
+  # mutate(across(where(is.character), \(x) as.numeric(as_factor(x)))) |> 
   # Encode datetime data
   mutate(datetime_utc = as.numeric(datetime_utc)) |>
+  select(lat, lon, datetime_utc) |>
+  # Pull out a sample of the data
   sample_n(10000) |>
   # Convert to matrix for clustering
   as.matrix()
 ```
 
 ## Cluster Data
-We can begin with a common approach to clustering: K-Means. Here we will define a helper function to evaluate a number of cluster sizes so that we can find the value of K after which the "within sum of squares" does not improve much more. And finally, we can use that identified value of K to create our clustering model.
-
-```{r}
-# This helper function will get performance metrics on clusters for values of K
-test_kmeans <- function(k, data) {
-  clusters <- kmeans(data, centers = k)
-  tibble(tss = clusters$tot.withinss)
-}
-
-# Define a range of values for K
-k <- 2:20
-names(k) <- as.character(k)
-
-# Gather metrics for values of K
-km_test <- map(k, test_kmeans, data = data_sample, .progress = TRUE) |>
-  list_rbind(names_to = "k") |>
-  mutate(k = parse_number(k))
-
-# Visualize Ks
-ggplot(data = km_test) +
-  geom_line(mapping = aes(x = k, y = tss)) +
-  theme_minimal() +
-  labs(title = "Total Sum of Squary Per K", subtitle = "For K-Means")
-
-# 10 seems like a good value for K
-best_k <- 10
-```
-
-Finally, we can try DBSCAN and HDBSCAN. The convenience of the HDBSCAN algorithm is that it does not assume a particular number of clusters or shape. So, it is more flexible at identifying structure in the data than K-Means and other techniques.
+As previously mentioned, we can use HDBSCAN to cluster our data. The convenience of the HDBSCAN algorithm is that it does not assume a particular number of clusters or shape. So, it is more flexible at identifying structure in the data than K-Means and other techniques.
 
 ```{r}
 # Min points is recommended as # variables + 1
@@ -114,54 +91,28 @@ cluster_hdb <- hdbscan(data_sample, minPts = min_points)
 Now we can use our models to classify the clusters for the remainder of the data.
 
 ```{r}
-# Define new data over which to officially cluster
+# Define new data over which to predict clusters
 data_new <- data_clean |>
   # Encode categorical data
-  mutate(across(where(is.character), \(x) as.numeric(as_factor(x)))) |> 
+  # mutate(across(where(is.character), \(x) as.numeric(as_factor(x)))) |> 
   # Encode datetime data
   mutate(datetime_utc = as.numeric(datetime_utc)) |>
+  select(lon, lat, datetime_utc) |>
   # Convert to matrix
   as.matrix()
 
-# Get the clusters using K-Means
-pred_km <- kmeans(data_new, centers = best_k)
-
 # Get the clusters using HDBSCAN
-pred_hdb <- predict(cluster_hdb, data = data_sample, newdata = data_new)
-```
-
-Now, let us take the predicted cluster IDs and insert them into our original data so that we can split and analyze subsets individually.
-
-```{r}
-data_clean <- data_clean |>
-  mutate(km_id = pred_km$cluster, hdb_id = pred_hdb)
+data_clean$hdb_id <- predict(cluster_hdb, data = data_sample, newdata = data_new)
 ```
 
 ## Visualize Results
 We can visualize the results of this clustering to see how the different clusters appear spatially, and we can look at how they appear temporally, too. This should give an idea of any patterns that might exist. We will start off by looking at the K-Means clusters.
 
 ```{r}
-# Split the data based on K-Means clusters
-split_km <- data_clean |>
-  split(~as_factor(km_id)) |>
-  map(\(x) st_as_sf(x, coords = c("lon", "lat"), crs = 4326)) 
-  
 # Split the data based on HDBSCAN clusters
 split_hdb <- data_clean |>
   split(~as_factor(hdb_id)) |>
   map(\(x) st_as_sf(x, coords = c("lon", "lat"), crs = 4326)) 
-
-# Geographically visualize K-Means clusters
-split_km |>
-  walk(\(x) {
-    s <- st_as_sf(st_sample(x, 1000), crs = 4326)
-    plt <- ggplot() +
-      geom_sf(data = boroughs) +
-      geom_sf(data = s, color = "red", size = 5) +
-      theme_minimal() +
-      labs(title = "K-Means Cluster Collision Locations")
-    plot(plt)
-  })
 
 # Geographically visualize HDBSCAN clusters
 split_hdb |>
@@ -169,16 +120,47 @@ split_hdb |>
     s <- st_as_sf(st_sample(x, 1000), crs = 4326)
     plt <- ggplot() +
       geom_sf(data = boroughs) +
-      geom_sf(data = s, color = "red", size = 5) +
+      geom_sf(data = s, color = "red") +
       theme_minimal() +
       labs(title = "HDBSCAN Cluster Collision Locations")
     plot(plt)
   })
 
 # Temporally visualize K-Means clusters
-map(split_km, \(x) range(x$datetime_utc))
-
 map(split_hdb, \(x) range(x$datetime_utc))
 ```
 
-The clusters seem to spread across the entire area of New York evenly. Furthermore, it appears that this initial attempt at clustering was able to identify like time ranges. In the case of K-Means, the clusters pertain to years. In the case of HDBSCAN the clusters pertain to seasons.
+## Analysis
+The clusters seem evenly spread out across New York City. In the case of HDBSCAN, the clusters appear to pertain to seasons for specific years. This might suggest distinct difference between years and seasons, which we can evalutae with a Kolmogorov-Smirnov test. it might be worthwhile to drill down into the data based on time and analysis specific ranges.
+
+```{r}
+ks.test(
+  split_hdb[[1]]$total_casualties,
+  split_hdb[[2]]$total_casualties
+)
+```
+
+Let us look at some time series data about the collisions to confirm this futher. We can see that there are clear seasonal patterns in at least the `number_of_persons_injured` variable (this is likely the case in other ones).
+
+```{r}
+walk(
+  1:length(split_hdb),
+  \(x) {
+    plt <- split_hdb[[x]] |>
+      mutate(date = as.Date(datetime_utc)) |>
+      group_by(date) |>
+      summarize(avg_cas = mean(total_casualties)) |>
+      ungroup() |>
+      ggplot() +
+      geom_line(aes(x = date, y = avg_cas))
+    plot(plt)
+  }
+)
+```
+
+## Save Results
+We can save this result so that we can reference it later.
+
+```{r}
+write_rds(split_hdb, "./data/clusters.rds")
+```
