@@ -17,9 +17,9 @@ library(tidyverse)
 
 library(dbscan)
 
-library(stdbscanr)
-
 library(knitr)
+
+library(sf)
 ```
 
 ## Load & Clean Data
@@ -39,6 +39,9 @@ glimpse(data_raw)
 colMeans(is.na(data_raw)) |>
  as_tibble(rownames = "variable") |>
  kable(caption = "Missing Data")
+
+# Load the spatial extent of boroughs for future visualization
+boroughs <- st_read("./data/nyc_boroughs.geojson")
 ```
 
 Since there is missing data in a few columns (and those columns are character data types), we will simply relable those values as "missing". We could instead use a sophisticated approach of converting that categorical data into factors and then using a classification model to fill in the values. Or we could encod them as numbers and use a regression model to estimate them. But, given the size of the data (+2mil records) that would take a lot computational power (which my laptop does not have).
@@ -58,7 +61,7 @@ Most of the algorithms that we will use require that the data be in a matrix rat
 ```{r}
 set.seed(1234) # For reproducible results
 
-data_matrix <- data_clean |>
+data_sample <- data_clean |>
   # Encode categorical data
   mutate(across(where(is.character), \(x) as.numeric(as_factor(x)))) |> 
   # Encode datetime data
@@ -83,7 +86,7 @@ k <- 2:20
 names(k) <- as.character(k)
 
 # Gather metrics for values of K
-km_test <- map(k, test_kmeans, data = data_matrix, .progress = TRUE) |>
+km_test <- map(k, test_kmeans, data = data_sample, .progress = TRUE) |>
   list_rbind(names_to = "k") |>
   mutate(k = parse_number(k))
 
@@ -95,21 +98,87 @@ ggplot(data = km_test) +
 
 # 10 seems like a good value for K
 best_k <- 10
-
-# Create the clustering model
-cluster_km <- kmeans(data_matrix, centers = best_k)
 ```
 
-Now we can try DBSCAN and HDBSCAN. The convenience of the HDBSCAN algorithm is that it does not assume a particular number of clusters or shape. So, it is more flexible at identifying structure in the data than DBSCAN. For the regular DBSCAN algorithm, we must choose a "neighborhood" size, as well as a minimum number of points. So, we are basically defining the structure of the clusters before looking at the data. This requires a fair bit of care and some tuning of parameters. Fortunately, the `dbscan` package in R comes with a few tools to help with this.
+Finally, we can try DBSCAN and HDBSCAN. The convenience of the HDBSCAN algorithm is that it does not assume a particular number of clusters or shape. So, it is more flexible at identifying structure in the data than K-Means and other techniques.
 
 ```{r}
 # Min points is recommended as # variables + 1
 min_points <- ncol(data_clean) + 1
 
-# Use this to find a value of "eps" for DBSCAN
-kNNdistplot(data_matrix, k = k)
-
-cluster_db <- dbscan(data_matrix, eps = 9000, minPts = min_points)
-
-cluster_hdb <- hdbscan(data_matrix, minPts = min_points)
+# Create a clustering model
+cluster_hdb <- hdbscan(data_sample, minPts = min_points)
 ```
+
+## Predict Clusters
+Now we can use our models to classify the clusters for the remainder of the data.
+
+```{r}
+# Define new data over which to officially cluster
+data_new <- data_clean |>
+  # Encode categorical data
+  mutate(across(where(is.character), \(x) as.numeric(as_factor(x)))) |> 
+  # Encode datetime data
+  mutate(datetime_utc = as.numeric(datetime_utc)) |>
+  # Convert to matrix
+  as.matrix()
+
+# Get the clusters using K-Means
+pred_km <- kmeans(data_new, centers = best_k)
+
+# Get the clusters using HDBSCAN
+pred_hdb <- predict(cluster_hdb, data = data_sample, newdata = data_new)
+```
+
+Now, let us take the predicted cluster IDs and insert them into our original data so that we can split and analyze subsets individually.
+
+```{r}
+data_clean <- data_clean |>
+  mutate(km_id = pred_km$cluster, hdb_id = pred_hdb)
+```
+
+## Visualize Results
+We can visualize the results of this clustering to see how the different clusters appear spatially, and we can look at how they appear temporally, too. This should give an idea of any patterns that might exist. We will start off by looking at the K-Means clusters.
+
+```{r}
+# Split the data based on K-Means clusters
+split_km <- data_clean |>
+  split(~as_factor(km_id)) |>
+  map(\(x) st_as_sf(x, coords = c("lon", "lat"), crs = 4326)) 
+  
+# Split the data based on HDBSCAN clusters
+split_hdb <- data_clean |>
+  split(~as_factor(hdb_id)) |>
+  map(\(x) st_as_sf(x, coords = c("lon", "lat"), crs = 4326)) 
+
+# Geographically visualize K-Means clusters
+split_km |>
+  walk(\(x) {
+    s <- st_as_sf(st_sample(x, 1000), crs = 4326)
+    plt <- ggplot() +
+      geom_sf(data = boroughs) +
+      geom_sf(data = s, color = "red", size = 5) +
+      theme_minimal() +
+      labs(title = "K-Means Cluster Collision Locations")
+    plot(plt)
+  })
+
+# Geographically visualize HDBSCAN clusters
+split_hdb |>
+  walk(\(x) {
+    s <- st_as_sf(st_sample(x, 1000), crs = 4326)
+    plt <- ggplot() +
+      geom_sf(data = boroughs) +
+      geom_sf(data = s, color = "red", size = 5) +
+      theme_minimal() +
+      labs(title = "HDBSCAN Cluster Collision Locations")
+    plot(plt)
+  })
+
+# Temporally visualize K-Means clusters
+map(split_km, \(x) range(x$datetime_utc))
+
+map(split_hdb, \(x) range(x$datetime_utc))
+```
+
+The clusters seem to spread across the entire area of New York evenly. Furthermore, it appears that this initial attempt at clustering was able to identify like time ranges. In the case of K-Means, the clusters pertain to years. In the case of HDBSCAN the clusters pertain to seasons.
