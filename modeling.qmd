@@ -1,0 +1,221 @@
+---
+title: "Modeling Vehicle Collisions"
+author: "Nathan Kurtz-Enko"
+format: pdf
+message: false
+warning: false
+---
+
+## Intro
+In this document, we will go through some explanatory and predictive modeling given some of the finds from clustering.
+
+## Libraries
+We will need the following libraries to handle data and perform modeling.
+
+```{r}
+library(tidyverse)
+
+library(tidymodels)
+
+library(dbscan)
+
+library(knitr)
+
+library(sf)
+
+library(leaflet)
+
+library(xtable)
+
+library(htmltools)
+```
+
+## Load Data
+We will repeat the same steps for loading and preparing the data here as we did for the clustering Quarto doc. 
+
+```{r}
+# Gather the data with cluster IDs from the preceeding Quarto doc
+data_raw <- read_rds("./data/clusters.rds") |>
+  # Fill in any missing data in character columns
+  mutate(across(where(is.character), \(x) coalesce(x, "missing"))) |>
+  # Encode character columns as numeric
+  mutate(across(where(is.character), \(x) as.numeric(as_factor(x)))) |>
+  # Encode time as numeric
+  mutate(datetime_utc = as.numeric(datetime_utc))
+
+boroughs <- st_read("./data/nyc_boroughs.geojson")
+```
+
+## Visualize
+One way to visualize the collisions is to create a grid/raster and color the individual cells based on the output of some model. So we will create a grid throughout the boroughs and then join in the collision data.
+
+```{r}
+# Create the grid in the boroughs
+grid <- st_make_grid(boroughs, cellsize = 0.05) |>
+  st_intersection(st_union(boroughs)) |>
+  st_as_sf() |>
+  st_make_valid() |>
+  mutate(grid_id = row_number())
+
+set.seed(1234) # For reproducible results
+
+# Get a sample of the data to see what an output would look like
+data_sample <- data_raw |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) |>
+  sample_n(size = 100000)
+
+# Join the data into the grid
+data_join <- st_join(grid, data_sample) |>
+  as_tibble() 
+
+# Summarize data for visualization
+data_vis <- data_join |>
+  reframe(
+    avg_casualties = sum(total_casualties, na.rm = TRUE), 
+    count_collisions = n(),
+    .by = grid_id
+  ) |>
+  left_join(grid) |>
+  st_as_sf() |>
+  mutate()
+  
+# Plot the data statically
+data_vis |>
+  ggplot() +
+  geom_sf(aes(fill = count_collisions)) +
+  geom_sf(data = boroughs, color = "red", fill = NA) +
+  scale_fill_viridis_c() 
+```
+
+We can use `leaflet` to make an interactive choropleth that visualizes some aspect of the data and coefficients related to models for a particular cell.
+
+```{r}
+# Define a palette for the leaflet map
+palette <- colorNumeric(palette = "viridis", domain = data_vis$count_collisions)
+
+# Define the leaflet map
+data_vis |>
+  left_join(coefs) |>
+  leaflet() |>
+  addTiles() |>
+  addPolygons(
+    fillColor = ~palette(count_collisions), 
+    fillOpacity = 0.9
+  ) |>
+  addLegend(pal = palette, values = ~count_collisions, title = "Count Collisions", position = "bottomright", opacity = 0.9)
+```
+
+## Modeling
+The weather might have an interesting relationship with frequency of collisions and the number of people injured in collisions. For each cell, we can aggregate the collisions to a lower temporal resolution and use average weather metrics to see what the relationship is.
+
+```{r}
+# Summarize the gridded collisions data for each grid cell
+data_summ <- data_join |>
+  mutate(date = as.Date(as.POSIXct(datetime_utc, origin = "1970-01-01"))) |>
+  reframe(
+    avg_casualty = mean(number_of_persons_injured + number_of_persons_killed, na.rm = T),
+    u10 = mean(u10),
+    v10 = mean(v10),
+    t2m = mean(t2m),
+    tp = mean(tp),
+    ro = mean(ro),
+    tcslw = mean(tcslw),
+    .by = c(grid_id, date)
+  ) |>
+  drop_na(date)
+
+# Split the data into different tables so that we can analyze them individually
+data_split <- data_summ |>
+  split(~grid_id)
+```
+
+In order to model the data we will first create a `recipe` with the using the package of the same name. This will create a series of transformation (if specified) that further prepare the data and can be applied to other data objects of the same structure. We can also store the formula for the model within this `recipe` object.
+
+```{r}
+# Define the response var
+var_response <- "avg_casualty"
+
+# Get predictor vars
+var_predictor <- names(select(data_raw, u10:tcslw))
+
+# Create the formula
+create_formula <- function(response, predictors) {
+  str_c(response, str_c(predictors, collapse = " + "), sep = " ~ ") |>
+    as.formula()
+}
+
+formulas <- create_formula(var_response, var_predictor)
+
+# Create the recipe
+create_recipe <- function(formula, data) {
+  recipe(formula, data = data)
+}
+
+recipes <- create_recipe(formulas, data_summ)
+```
+
+Next, we can create some model specifications, i.e., define the models that we would like to fit, and any paramaters that go along with them. In our case, we can take a look at a few different: linear regression
+
+```{r}
+# Create individual model specifications
+model_lm <- linear_reg(mode = "regression", engine = "lm")
+```
+
+Now we can create a workflow for each recipe and the list of model specifications using the `workflowset` package.
+
+```{r}
+create_wflow <- function(recipe, model) {
+  workflow(recipe, model)
+}
+
+wflows <-create_wflow(recipes, model_lm)
+```
+
+Finally, we can train.
+
+```{r}
+fit_wflow <- function(data, wflow) {
+  fit(wflow, data = data)
+}
+
+fits <- map(
+  data_split,
+  fit_wflow,
+  wflow = wflows,
+  .progress = TRUE
+)
+```
+
+Now, we can extract the coefficients of each model.
+
+```{r}
+extract_coeffs <- function(fit) {
+  tidy(fit)
+}
+
+coefs <- fits |>
+  map(extract_coeffs) |>
+  map(\(x) tibble(tooltip = HTML(kable(x, format = "html")))) |>
+  list_rbind(names_to = "grid_id") |>
+  mutate(grid_id = as.numeric(grid_id))
+```
+
+And, we can add these as a tooltip to the visualization.
+
+```{r}
+data_vis |>
+  left_join(coefs) |>
+  leaflet() |>
+  addTiles() |>
+  addPolygons(
+    fillColor = ~palette(count_collisions), 
+    fillOpacity = 0.9,
+    label = ~tooltip,
+    labelOptions = labelOptions(
+        textsize = "13px",
+        direction = "auto"
+    )
+  ) |>
+  addLegend(pal = palette, values = ~count_collisions, title = "Count Collisions", position = "bottomright", opacity = 0.9)
+
+```
