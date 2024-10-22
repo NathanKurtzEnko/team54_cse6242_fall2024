@@ -17,6 +17,8 @@ library(tidyverse)
 
 library(dbscan)
 
+library(smooth)
+
 library(knitr)
 
 library(sf)
@@ -55,8 +57,39 @@ data_clean <- data_raw |>
   # Classify data as missing
   mutate(across(where(is.character), \(x) coalesce(x, "missing"))) |>
   mutate(total_casualties = number_of_persons_injured + number_of_persons_killed)
-  # filter(year(datetime_utc) == 2020)
+```
 
+There is likely a lot of seaonality and trends in the data, so we will apply ARIMA to address these things prior to any modeling.
+
+```{r}
+start_date <- c(2012, 7, 1)
+
+end_date <- c(2024, 9, 23)
+
+vars_number <- data_clean |>
+  select(where(is.numeric))
+
+frequency <- 4
+
+data_ts <- ts(
+  data_clean$number_of_persons_injured,
+  start = start_date,
+  # end = end_date,
+  frequency = frequency
+)
+
+s <- Sys.time()
+data_smooth <- HoltWinters(data_ts, seasonal = "additive")
+e <- Sys.time()
+difftime(e, s)
+
+plot(data_ts)
+
+plot(data_smooth)
+
+ggplot(data_clean) +
+  geom_line(aes(datetime_utc, number_of_persons_injured))
+# decompose(timeseries)
 ```
 
 HDBSCAN is available in R via the `dbscan` package. However, this implementation requires the data be a matrix rather than a data frame. So, we can take our "clean" data and convert that into a matrix. Additionally, we have a lot of data, and while it might be nice to cluster using everything, that is also computationally expensive. So we will grab a sample of points and use that for initial clustering. Then, we can use that model to predict clusters for the remainder of the data.
@@ -66,7 +99,7 @@ set.seed(1234) # For reproducible results
 
 data_sample <- data_clean |>
   # Encode categorical data
-  # mutate(across(where(is.character), \(x) as.numeric(as_factor(x)))) |> 
+  mutate(across(where(is.character), \(x) as.numeric(as_factor(x)))) |> 
   # Encode datetime data
   mutate(datetime_utc = as.numeric(datetime_utc)) |>
   select(lat, lon, datetime_utc) |>
@@ -162,5 +195,5 @@ walk(
 We can save this result so that we can reference it later.
 
 ```{r}
-write_rds(split_hdb, "./data/clusters.rds")
+write_rds(data_clean, "./data/clusters.rds")
 ```
