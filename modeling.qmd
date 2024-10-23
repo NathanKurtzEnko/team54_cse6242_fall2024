@@ -30,20 +30,192 @@ library(xtable)
 library(htmltools)
 ```
 
-## Load Data
-We will repeat the same steps for loading and preparing the data here as we did for the clustering Quarto doc. 
+## Load & Clean Data
+First, let us load the data. 
 
 ```{r}
-# Gather the data with cluster IDs from the preceeding Quarto doc
-data_raw <- read_rds("./data/clusters.rds") |>
+# Get data files
+data_files <- list.files("./data/crashes/clean/", full.names = TRUE)
+
+# Load collisions data
+data_raw <- list_rbind(map(data_files, read_csv)) |>
+  # Drop the vehicle code columns because these are just noise 
+  select(!starts_with("vehicle_type")) |>
+  # Get the lon/lat coords out of the geometry column
+  mutate(geometry = str_sub(geometry, 3L, -2L)) |>
+  separate(geometry, into = c("lon", "lat"), sep = ",") |>
+  mutate(lon = as.numeric(lon), lat = as.numeric(lat)) 
+
+# Load the boroughs boundaries
+boroughs <- st_read("./data/nyc_boroughs.geojson")
+```
+
+Next, we can do a little clean up. We will convert categorical data into factors and relable them into consistent categories. And we can make sure that everything is parsed into the correct data type.
+
+```{r}
+# Define new levels for factors 
+distracted_driving <- c(
+  "Driver Inattention/Distraction",
+  "Passenger Distraction",
+  "Outside Car Distraction",
+  "Cell Phone (hand-Held)",
+  "Other Electronic Device",
+  "Cell Phone (hands-free)",
+  "Cell Phone (hand-held)",
+  "Using On Board Navigation Device",
+  "Texting"
+)
+
+driver_error <- c(
+  "Passing or Lane Usage Improper",
+  "Following Too Closely",
+  "Unsafe Speed",
+  "Failure to Yield Right-of-Way",
+  "Backing Unsafely",
+  "Turning Improperly",
+  "Unsafe Lane Changing",
+  "Driver Inexperience",
+  "Passing Too Closely",
+  "Aggressive Driving/Road Rage",
+  "Failure to Keep Right",
+  "Traffic Control Disregarded"
+)
+
+environment_issue <- c(
+  "Pavement Slippery",
+  "Other Vehicular",
+  "Reaction to Uninvolved Vehicle",
+  "Oversized Vehicle",
+  "View Obstructed/Limited",
+  "Lane Marking Improper/Inadequate",
+  "Obstruction/Debris",
+  "Animals Action",
+  "Traffic Control Device Improper/Non-Working",
+  "Pavement Defective",
+  "Glare",
+  "Reaction to Other Uninvolved Vehicle",
+  "Shoulders Defective/Improper",
+  "Driverless/Runaway Vehicle"
+)
+
+vehicle_issue <- c(
+  "Brakes Defective",
+  "Tire Failure/Inadequate",
+  "Steering Failure",
+  "Headlights Defective",
+  "Accelerator Defective",
+  "Other Lighting Defects",
+  "Tinted Windows",
+  "Tow Hitch Defective",
+  "Windshield Inadequate",
+  "Vehicle Vandalism"
+)
+
+inebriation <- c(
+  "Alcohol Involvement",
+  "Drugs (illegal)",
+  "Prescription Medication",
+  "Drugs (Illegal)"
+)
+
+fatigue <- c(
+  "Lost Consciousness",
+  "Fell Asleep",
+  "Fatigued/Drowsy",
+  "Illnes",
+  "Illness"
+)
+
+other <- c(
+  "Pedestrian/Bicyclist/Other Pedestrian Error/Confusion",
+  "80",
+  "Eating or Drinking",
+  "Listening/Using Headphones",
+  "1"
+)
+
+missing <- c(
+  "Unspecified",
+  "missing"
+)
+
+fct_lvls <- c(
+  "distracted_driving",
+  "driver_error",
+  "environment_issue",
+  "vehicle_issue",
+  "inebriation",
+  "fatigue",
+  "other",
+  "missing"
+)
+
+# Clean and recode categorical data
+data_clean <- data_raw |>
   # Fill in any missing data in character columns
   mutate(across(where(is.character), \(x) coalesce(x, "missing"))) |>
-  # Encode character columns as numeric
-  mutate(across(where(is.character), \(x) as.numeric(as_factor(x)))) |>
+  # Recode the contributing factor columns
+  mutate(
+    contributing_factor_vehicle_1 = case_when(
+      contributing_factor_vehicle_1 %in% distracted_driving ~ "distracted_driving",
+      contributing_factor_vehicle_1 %in% driver_error ~ "driver_error",
+      contributing_factor_vehicle_1 %in% environment_issue ~ "environment_issue",
+      contributing_factor_vehicle_1 %in% vehicle_issue ~ "vehicle_issue",
+      contributing_factor_vehicle_1 %in% inebriation ~ "inebriation",
+      contributing_factor_vehicle_1 %in% fatigue ~ "fatigue",
+      contributing_factor_vehicle_1 %in% missing ~ "missing",
+      .default = "other"
+    ),
+    contributing_factor_vehicle_2 = case_when(
+      contributing_factor_vehicle_2 %in% distracted_driving ~ "distracted_driving",
+      contributing_factor_vehicle_2 %in% driver_error ~ "driver_error",
+      contributing_factor_vehicle_2 %in% environment_issue ~ "environment_issue",
+      contributing_factor_vehicle_2 %in% vehicle_issue ~ "vehicle_issue",
+      contributing_factor_vehicle_2 %in% inebriation ~ "inebriation",
+      contributing_factor_vehicle_2 %in% fatigue ~ "fatigue",
+      contributing_factor_vehicle_2 %in% missing ~ "missing",
+      .default = "other"
+    )
+  ) |>
+  # Convert categorical columns to factor data type
+  mutate(across(starts_with("contributing"), \(x) fct(x, levels = fct_lvls))) |>
+  mutate(borough = fct(borough, levels = sort(unique(borough)))) |>
   # Encode time as numeric
   mutate(datetime_utc = as.numeric(datetime_utc))
+```
 
-boroughs <- st_read("./data/nyc_boroughs.geojson")
+Finally, in order to take full advantage of the categorical data, it might be useful to convert them into dummy variables.
+
+```{r}
+# Dummies for contributing factor 1
+data_cont_fct_1 <- data_clean |>
+  reframe(
+    count = n(),
+    .by = c(collision_id, contributing_factor_vehicle_1)
+  ) |>
+  pivot_wider(
+    names_from = contributing_factor_vehicle_1,
+    values_from = count,
+    values_fill = 0
+  )
+
+# Dummies for contributing factor 2
+data_cont_fct_2 <- data_clean |>
+  reframe(
+    count = n(),
+    .by = c(collision_id, contributing_factor_vehicle_2)
+  ) |>
+  pivot_wider(
+    names_from = contributing_factor_vehicle_2,
+    values_from = count,
+    values_fill = 0
+  )
+
+# Combine dummy variables
+data_dummies <- bind_rows(data_cont_fct_1, data_cont_fct_2) |>
+  reframe(across(any_of(fct_lvls), sum), .by = collision_id) |>
+  left_join(data_clean, by = "collision_id") |>
+  select(!starts_with("contributing"))
 ```
 
 ## Visualize
@@ -60,7 +232,7 @@ grid <- st_make_grid(boroughs, cellsize = 0.05) |>
 set.seed(1234) # For reproducible results
 
 # Get a sample of the data to see what an output would look like
-data_sample <- data_raw |>
+data_sample <- data_dummies |>
   st_as_sf(coords = c("lon", "lat"), crs = 4326) |>
   sample_n(size = 100000)
 
@@ -70,11 +242,7 @@ data_join <- st_join(grid, data_sample) |>
 
 # Summarize data for visualization
 data_vis <- data_join |>
-  reframe(
-    avg_casualties = sum(total_casualties, na.rm = TRUE), 
-    count_collisions = n(),
-    .by = grid_id
-  ) |>
+  reframe(count_collisions = n(), .by = grid_id) |>
   left_join(grid) |>
   st_as_sf() |>
   mutate()
@@ -84,7 +252,8 @@ data_vis |>
   ggplot() +
   geom_sf(aes(fill = count_collisions)) +
   geom_sf(data = boroughs, color = "red", fill = NA) +
-  scale_fill_viridis_c() 
+  scale_fill_viridis_c() +
+  theme_minimal()
 ```
 
 We can use `leaflet` to make an interactive choropleth that visualizes some aspect of the data and coefficients related to models for a particular cell.
@@ -100,7 +269,12 @@ data_vis |>
   addTiles() |>
   addPolygons(
     fillColor = ~palette(count_collisions), 
-    fillOpacity = 0.9
+    fillOpacity = 0.9,
+    label = ~tooltip,
+    labelOptions = labelOptions(
+        textsize = "13px",
+        direction = "auto"
+    )
   ) |>
   addLegend(pal = palette, values = ~count_collisions, title = "Count Collisions", position = "bottomright", opacity = 0.9)
 ```
@@ -113,7 +287,8 @@ The weather might have an interesting relationship with frequency of collisions 
 data_summ <- data_join |>
   mutate(date = as.Date(as.POSIXct(datetime_utc, origin = "1970-01-01"))) |>
   reframe(
-    avg_casualty = mean(number_of_persons_injured + number_of_persons_killed, na.rm = T),
+    total_collisions = n(),
+    across(any_of(fct_lvls), sum),
     u10 = mean(u10),
     v10 = mean(v10),
     t2m = mean(t2m),
@@ -133,10 +308,12 @@ In order to model the data we will first create a `recipe` with the using the pa
 
 ```{r}
 # Define the response var
-var_response <- "avg_casualty"
+var_response <- "total_collisions"
 
 # Get predictor vars
-var_predictor <- names(select(data_raw, u10:tcslw))
+var_predictor <- data_summ |>
+  select(distracted_driving:tcslw) |>
+  names()
 
 # Create the formula
 create_formula <- function(response, predictors) {
@@ -148,7 +325,9 @@ formulas <- create_formula(var_response, var_predictor)
 
 # Create the recipe
 create_recipe <- function(formula, data) {
-  recipe(formula, data = data)
+  recipe(formula, data = data) |>
+    step_nzv(all_predictors()) |>
+    step_normalize(all_predictors())
 }
 
 recipes <- create_recipe(formulas, data_summ)
@@ -198,24 +377,4 @@ coefs <- fits |>
   map(\(x) tibble(tooltip = HTML(kable(x, format = "html")))) |>
   list_rbind(names_to = "grid_id") |>
   mutate(grid_id = as.numeric(grid_id))
-```
-
-And, we can add these as a tooltip to the visualization.
-
-```{r}
-data_vis |>
-  left_join(coefs) |>
-  leaflet() |>
-  addTiles() |>
-  addPolygons(
-    fillColor = ~palette(count_collisions), 
-    fillOpacity = 0.9,
-    label = ~tooltip,
-    labelOptions = labelOptions(
-        textsize = "13px",
-        direction = "auto"
-    )
-  ) |>
-  addLegend(pal = palette, values = ~count_collisions, title = "Count Collisions", position = "bottomright", opacity = 0.9)
-
 ```
